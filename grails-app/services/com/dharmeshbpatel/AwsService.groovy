@@ -12,11 +12,14 @@ class AwsService {
     static final int INSTANCE_COUNT = 2
     static final int RESERVED_COUNT = 3
     static final int DIFFERENCE = 4
+
+    static final int MOVEMENT_INSTANCE_TYPE = 0
+    static final int MOVEMENT_AVAILABILITY_ZONE = 1
     static final int MOVEMENT_DIFF = 2
 
     def amazonWebService
 
-    def optimizeReservedInstances(dryRun = true) {
+    def optimizeReservedInstanceUtilization(dryRun = true) {
         def activeInstances = getActiveInstances()
         def activeReservedInstances = getActiveReservedInstances()
 
@@ -25,7 +28,12 @@ class AwsService {
         def totalActiveInstances = activeInstances.size() ?: 0
         def totalActiveReservedInstances = activeReservedInstances.size() ?: 0
 
-        printAllocationTable(currentState, totalActiveInstances, totalActiveReservedInstances)
+        log.info("Total Active Instances - $totalActiveInstances")
+        log.info("Total Purchased Reserved Instances - $totalActiveReservedInstances")
+        printAllocationTable(currentState, "Current")
+
+        def optimizedState = optimize(currentState)
+        printAllocationTable(optimizedState, "Optimized")
 
         if (! dryRun) {
             // TODO update reserved instances
@@ -70,47 +78,45 @@ class AwsService {
         return output
     }
 
-    def buildReallocationTable(state) {
-        def balanceNeeded = true
-
+    /**
+     * This modifies the "state" for what it would look optimally
+     */
+    def optimize(state) {
         if (state.size() == 0) {
             log.error("I got nothing to work with.")
             return
         }
 
-        // Modify the State copy
-        def balanceableList = state.collect { it }
+        def unbalancedInstances = state.collect { it }
 
-        while (balanceNeeded) {
-            balanceableList = findBalanceableGroup(balanceableList)
+        while (shouldReallocate(findUnbalancedInstances(unbalancedInstances))) {
+            unbalancedInstances = findUnbalancedInstances(unbalancedInstances)
 
-            if (balanceableList.size() > 0) {
-
-                def largestPositive = findLargestPostiveDiff(balanceableList)
+            if (unbalancedInstances.size() > 0) {
+                def largestPositive = findLargestPostiveDiff(unbalancedInstances)
                 def type = largestPositive[INSTANCE_TYPE]
-                def largestNegative = findLargestNegativeDiff(balanceableList, type)
+                def largestNegative = findLargestNegativeDiff(unbalancedInstances, type)
 
                 def typeReallocations = reallocate(type, largestPositive, largestNegative)
 
-                balanceableList = rebalance(balanceableList, typeReallocations)
-                balanceNeeded = canBalance(findBalanceableGroup(balanceableList))
+                unbalancedInstances = recalculateState(unbalancedInstances, typeReallocations)
             } else {
                 break
             }
         }
 
-        printAllocationTable(state, 0, 0)
         return state
     }
 
-    // [type, zone, diff]
     /**
-     * NOTE: These changes will impact original list since sourceList contents are references still used by "state" & "balanceableList"
+     * NOTE: These changes will impact original list since sourceList contents are
+     * references
      */
-    def rebalance(sourceList, reallocations) {
+    def recalculateState(sourceList, reallocations) {
         reallocations.each { reallocation ->
             def src = sourceList.find {
-                it[INSTANCE_TYPE] == reallocation[INSTANCE_TYPE] && it[AVAILABILITY_ZONE] == reallocation[AVAILABILITY_ZONE]
+                it[INSTANCE_TYPE] == reallocation[MOVEMENT_INSTANCE_TYPE] &&
+                it[AVAILABILITY_ZONE] == reallocation[MOVEMENT_AVAILABILITY_ZONE]
             }
 
             if (src) {
@@ -130,7 +136,7 @@ class AwsService {
         balanceableListForType.findAll { it[INSTANCE_TYPE] == type }.min { it[DIFFERENCE] }
     }
 
-    def findBalanceableGroup(balanceableList) {
+    def findUnbalancedInstances(balanceableList) {
         return balanceableList.findAll { it[DIFFERENCE] != 0 }
     }
 
@@ -156,18 +162,17 @@ class AwsService {
     /**
      * Check if all in positive or all in negative, if not then continue balancing
      */
-    def canBalance(balanceableList) {
+    def shouldReallocate(balanceableList) {
         def balanceableListByType = balanceableList.groupBy { it[INSTANCE_TYPE] }
 
         return balanceableListByType.find { type, _balanceableList ->
            (_balanceableList.findAll { it[DIFFERENCE] >= 0 }.size()) != _balanceableList.size() &&
-                    (_balanceableList.findAll { it[DIFFERENCE] <= 0 }.size() != _balanceableList.size())
+           (_balanceableList.findAll { it[DIFFERENCE] <= 0 }.size() != _balanceableList.size())
         }
     }
 
-
     /**
-     * Returns rows in format [instance type, aws zone, instances in zone, reserved instances avail, diff]
+     * Returns rows in format [instance type, aws zone, count of instances, count of reserved instances, diff]
      */
     def buildReservedState(instanceGroup, reserveGroup) {
         def output = []
@@ -188,18 +193,20 @@ class AwsService {
 
                 def diff = reservedCount - (instanceGroup[typeKey][zoneKey]?.size() ?: 0)
 
+                def instanceCount = 0
+
                 if (instanceGroup[typeKey] && instanceGroup[typeKey][zoneKey]) {
-                    output << [typeKey, zoneKey, instanceGroup[typeKey][zoneKey]?.size(), reservedCount, diff]
-                } else {
-                    output << [typeKey, zoneKey, 0, reservedCount, diff]
+                    instanceCount = instanceGroup[typeKey][zoneKey]?.size()
                 }
+
+                output << [typeKey, zoneKey, instanceCount, reservedCount, diff]
             }
         }
 
         return output
     }
 
-    def printAllocationTable(output, totalInstances, totalReserved) {
+    def printAllocationTable(output, shortDescription = "") {
         def defaultPad = 15
 
         String outputString = "Instance Type".padRight(defaultPad) + "Aws Zone".padLeft(defaultPad) + "Current Count".padLeft(defaultPad) + "Reserved Avail".padLeft(defaultPad) + "Diff".padLeft(defaultPad) + "\n"
@@ -213,11 +220,9 @@ class AwsService {
                     "\n"
         }
 
-        log.info("*******************************************")
-        log.info("AWS Reserved Instance Info Table")
-        log.info("\n" + outputString)
-        log.info("Total Instances: $totalInstances")
-        log.info("Total Reserved Instances: $totalReserved")
-        log.info("*******************************************")
+        def title = "******************** AWS Reserved Instance (${shortDescription}) ***********************"
+        log.info(title)
+        log.info("\n" + outputString + "\n")
+        log.info("*".multiply(title.length()))
     }
 }
